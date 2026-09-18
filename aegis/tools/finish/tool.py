@@ -30,10 +30,11 @@ _MANDATORY_CATEGORIES = {
 def _check_coverage(ctx: RunContextWrapper) -> list[str]:
     """Check which mandatory categories have been tested with minimum enforcement."""
     inner = ctx.context if isinstance(ctx.context, dict) else {}
-    tested = inner.get("tested_categories", set())
+    from aegis.tools.enforcement.tracker import get_tracker
 
-    if not isinstance(tested, set):
-        tested = set(tested) if tested else set()
+    tracker = get_tracker(ctx)
+    tested = tracker.completed_categories
+    inner["tested_categories"] = tested
 
     missing = []
 
@@ -44,10 +45,6 @@ def _check_coverage(ctx: RunContextWrapper) -> list[str]:
 
     # Stage 2: Check minimum tests per category using TestTracker
     if not missing:  # Only check minimums if all categories are marked
-        from aegis.tools.enforcement.tracker import get_tracker
-
-        tracker = get_tracker(ctx)
-
         for cat_id in _MANDATORY_CATEGORIES:
             passed, reasons = tracker.check_minimums(cat_id)
             if not passed:
@@ -58,18 +55,32 @@ def _check_coverage(ctx: RunContextWrapper) -> list[str]:
         from aegis.tools.enforcement.verifier import EvidenceVerifier
 
         verifier = EvidenceVerifier()
+        test_evidence = inner.setdefault("test_evidence", {})
 
         for cat_id in _MANDATORY_CATEGORIES:
+            test_evidence[cat_id] = tracker.category_evidence(cat_id)
             evidence_result = verifier.verify_category_evidence(cat_id, inner)
             if not evidence_result["passed"]:
                 missing.append(
                     f"{cat_id} — missing evidence: {', '.join(evidence_result['missing'])}"
                 )
 
+    # High-confidence queued work is a real completion blocker. This prevents
+    # the agent from satisfying category counts while abandoning concrete,
+    # executable authorization hypotheses discovered during the scan.
+    from aegis.detection.store import DetectionStore
+
+    detection_store = inner.get("_detection_store")
+    if isinstance(detection_store, DetectionStore):
+        health = detection_store.campaign_health()
+        if health["high_priority_open"]:
+            missing.append(
+                "detection campaign — "
+                f"{health['high_priority_open']} high-priority hypotheses remain open; "
+                "run the detection campaign or resolve them before finishing"
+            )
+
     return missing
-
-
-_MAX_FINISH_ATTEMPTS = 3
 
 
 def _do_finish(
@@ -90,19 +101,6 @@ def _do_finish(
             ),
         }
 
-    # Track finish attempts to prevent infinite loop
-    inner = ctx.context if isinstance(ctx.context, dict) else {} if ctx else {}
-    finish_attempts = inner.get("_finish_attempts", 0)
-    if finish_attempts >= _MAX_FINISH_ATTEMPTS:
-        # After max attempts, force completion with warning
-        logger.warning(
-            "finish_scan called %d times — forcing completion despite incomplete coverage",
-            finish_attempts,
-        )
-        inner["_finish_forced"] = True
-    else:
-        inner["_finish_attempts"] = finish_attempts + 1
-
     errors: list[str] = []
     if not executive_summary.strip():
         errors.append("Executive summary cannot be empty")
@@ -113,8 +111,9 @@ def _do_finish(
     if not recommendations.strip():
         errors.append("Recommendations cannot be empty")
 
-    # Check category coverage (skip if forced)
-    if ctx is not None and not inner.get("_finish_forced"):
+    # Coverage is a hard completion condition. Repeated finish attempts do not
+    # manufacture evidence or turn an incomplete scan into a complete one.
+    if ctx is not None:
         missing = _check_coverage(ctx)
         if missing:
             errors.append(

@@ -37,8 +37,11 @@ from aegis.core.inputs import (
 )
 from aegis.core.paths import run_dir_for, runtime_state_dir
 from aegis.core.sessions import open_agent_session
+from aegis.detection.benchmark import BenchmarkRunRecorder
+from aegis.detection.store import DetectionStore
 from aegis.runtime import session_manager
 from aegis.telemetry.logging import set_scan_id, setup_scan_logging
+from aegis.tools.enforcement.tracker import TestTracker
 
 
 if TYPE_CHECKING:
@@ -148,6 +151,9 @@ async def run_aegis_scan(
     logger.info("Sandbox ready for scan %s", scan_id)
 
     sessions_to_close: list[SQLiteSession] = []
+    test_tracker: TestTracker | None = None
+    detection_store: DetectionStore | None = None
+    benchmark_recorder: BenchmarkRunRecorder | None = None
 
     try:
         targets = scan_config.get("targets") or []
@@ -212,6 +218,17 @@ async def run_aegis_scan(
                 **kwargs,
             )
 
+        test_tracker = TestTracker(state_dir / "coverage.json")
+        detection_store = DetectionStore(state_dir / "detection.json")
+        benchmark_recorder = BenchmarkRunRecorder(
+            state_dir / "benchmark_run.json",
+            scan_id=scan_id,
+            model=resolved_model,
+            scan_mode=scan_mode,
+            target_count=len(targets),
+            max_turns=max_turns,
+            max_budget_usd=max_budget_usd,
+        )
         context: dict[str, Any] = {
             "coordinator": coordinator,
             "sandbox_session": bundle["session"],
@@ -221,6 +238,17 @@ async def run_aegis_scan(
             "parent_id": None,
             "interactive": interactive,
             "spawn_child_agent": spawn_child_agent,
+            # One execution-backed coverage ledger is created before any child
+            # agents can spawn. Child contexts shallow-copy this object, so
+            # coverage and findings remain scan-wide instead of agent-local.
+            "_test_tracker": test_tracker,
+            "_detection_store": detection_store,
+            "_benchmark_recorder": benchmark_recorder,
+            "tested_categories": test_tracker.completed_categories,
+            "test_evidence": {
+                category: test_tracker.category_evidence(category)
+                for category in test_tracker.completed_categories
+            },
         }
 
         root_session = open_agent_session(root_id, agents_db)
@@ -331,6 +359,32 @@ async def run_aegis_scan(
                 await coordinator.set_status(root_id, "failed")
         raise
     finally:
+        if benchmark_recorder is not None and benchmark_recorder.record.get("finished_at") is None:
+            metrics: dict[str, Any] = {}
+            if detection_store is not None:
+                health = detection_store.campaign_health()
+                metrics.update(health)
+                metrics["detection_confirmed_total"] = health["hypothesis_counts"]["confirmed"]
+            if test_tracker is not None:
+                metrics.update(
+                    {
+                        "coverage_test_count": test_tracker.get_total_tests(),
+                        "coverage_finding_count": test_tracker.get_total_findings(),
+                    }
+                )
+            with contextlib.suppress(Exception):
+                from aegis.report.state import get_global_report_state
+
+                report_state = get_global_report_state()
+                if report_state is not None:
+                    metrics["llm_usage"] = report_state.run_record.get("llm_usage", {})
+            failure_stage = str(benchmark_recorder.record.get("failure_stage") or "discovery")
+            benchmark_recorder.finish(
+                solved=False,
+                expected_value_present=None,
+                failure_stage=failure_stage,
+                metrics=metrics,
+            )
         for s in sessions_to_close:
             with contextlib.suppress(Exception):
                 s.close()

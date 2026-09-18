@@ -68,7 +68,7 @@ Available helpers:
 
 - `list_requests(httpql_filter=, first=50, after=, sort_by=, sort_order=, scope_id=)` returns a cursor-paginated Caido SDK `Connection`.
 - `view_request(request_id, part="request")` returns a Caido SDK request object with raw request/response bytes.
-- `repeat_request(request_id, modifications={...})` replays a captured request after modifying `url`, `params`, `headers`, `body`, or `cookies`.
+- `repeat_request(request_id, modifications={...})` replays a captured request after modifying `url`, `params`, `headers`, `body`, or `cookies`. When the replay is a security probe, also pass its coverage `category`, stable `endpoint_template`, `sub_category`, `test_type`, `parameter`, `payload_family`, `auth_context`, `oracle`, and observed outcome so the execution is recorded automatically.
 - `list_sitemap(scope_id=, parent_id=, depth="DIRECT", page=1)` walks Caido's request-tree view of the discovered surface. Omit `parent_id` for root domains; pass an entry id with `depth="DIRECT"` or `"ALL"` to drill in.
 - `view_sitemap_entry(entry_id)` returns one entry plus its 30 most recent related requests.
 - `scope_rules(action, allowlist=, denylist=, scope_id=, scope_name=)` manages Caido scopes.
@@ -78,6 +78,10 @@ external API), use `exec_command` with `curl` / `httpx` / `requests`. The
 sandbox's `HTTP_PROXY` env routes all such traffic through Caido
 automatically, so it shows up in `list_requests` and you can use
 `repeat_request` to replay-and-modify any of it.
+
+After a non-Caido tool completes a security probe, call
+`record_test_evidence` with a durable reference to its output. Summary counts
+passed to `track_category_tested` never create coverage by themselves.
 
 ## Workflow
 

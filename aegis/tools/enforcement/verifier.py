@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, ClassVar
+
+from aegis.tools.enforcement.tracker import HTTP_EXECUTION_TOOLS
 
 
 class EvidenceVerifier:
     """Verify that testing evidence exists for each category."""
 
-    VERIFICATION_QUESTIONS: dict[str, list[str]] = {
+    VERIFICATION_QUESTIONS: ClassVar[dict[str, list[str]]] = {
         "auth": [
             "Tested login endpoint with invalid credentials",
             "Tested JWT token manipulation or weak secrets",
@@ -83,7 +85,10 @@ class EvidenceVerifier:
             "has_endpoints": len(endpoints_tested) > 0,
             "has_findings_or_confirmed_clean": len(findings) > 0 or no_vulns_confirmed,
             "has_http_evidence": any(
-                "http_request" in str(t) or "curl" in str(t).lower() for t in tests
+                bool(t.get("evidence_ref"))
+                and str(t.get("tool", "")).lower() in HTTP_EXECUTION_TOOLS
+                for t in tests
+                if isinstance(t, dict)
             ),
             "used_multiple_tools": len(set(tools_used)) >= 2
             or (len(tools_used) >= 1 and len(tests) >= 5),

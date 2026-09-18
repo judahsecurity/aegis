@@ -723,7 +723,12 @@ def login_with_credentials(
     # Try JSON login first
     resp = requests.request(method, url, json=credentials, timeout=10)
     
-    result = {"success": False, "token": None, "cookies": {}, "headers": {}}
+    result: dict[str, Any] = {
+        "success": False,
+        "token": None,
+        "cookies": {},
+        "headers": {},
+    }
     
     if resp.status_code in (200, 201):
         result["success"] = True
@@ -738,8 +743,9 @@ def login_with_credentials(
                     if isinstance(value, dict):
                         # Nested response like {"data": {"token": "..."}}
                         for subkey in ["token", "access_token", "jwt"]:
-                            if subkey in value:
-                                result["token"] = value[subkey]
+                            nested = value.get(subkey)
+                            if isinstance(nested, str):
+                                result["token"] = nested
                                 break
                     elif isinstance(value, str) and len(value) > 20:
                         result["token"] = value
@@ -796,7 +802,7 @@ def extract_auth_tokens(response_body: str) -> dict[str, str]:
     return tokens
 
 
-def build_auth_headers(token: str = None, api_key: str = None) -> dict[str, str]:
+def build_auth_headers(token: str | None = None, api_key: str | None = None) -> dict[str, str]:
     """Build authentication headers."""
     headers = {}
     if token:
@@ -818,6 +824,7 @@ def decode_jwt_payload(token: str) -> dict[str, Any]:
         if padding != 4:
             payload += "=" * padding
         decoded = base64.urlsafe_b64decode(payload)
-        return json.loads(decoded)
+        value = json.loads(decoded)
+        return value if isinstance(value, dict) else {}
     except:
         return {}

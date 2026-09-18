@@ -115,6 +115,18 @@ mutation Promote($id:ID!){
 
 ## Testing Methodology
 
+### Aegis Detection Workflow
+
+1. Capture privileged and basic-user sessions, then assign accurate roles with
+   `register_test_identity` when known.
+2. Privileged route names and privileged owner roles generate vertical-authorization
+   hypotheses through `generate_authorization_hypotheses`.
+3. Use `run_detection_campaign` to replay the identical privileged request as its owner,
+   a lower-privileged identity, and an anonymous control.
+4. A finding requires semantic equivalence and matching protected fields between the
+   privileged and lower-privileged responses, anonymous denial, and an independent repeat.
+5. Inspect `inspect_campaign_health` and change attack axis when progress stagnates.
+
 1. **Build Actor × Action matrix** - Unauth, basic, premium, staff/admin; enumerate actions per role
 2. **Obtain tokens/sessions** - For each role
 3. **Exercise every action** - Across all transports and encodings (JSON, form, multipart), including method overrides

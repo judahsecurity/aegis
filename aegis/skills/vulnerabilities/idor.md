@@ -169,6 +169,25 @@ query IDOR {
 
 ## Testing Methodology
 
+### Aegis Detection Workflow
+
+1. Capture authenticated traffic for at least two separate users. `list_requests`
+   automatically ingests full captured exchanges and clusters recognized sessions.
+2. Use `bootstrap_detection_identities` for a specific batch of captured request IDs.
+   Call `register_test_identity` to give important sessions stable names and roles.
+3. Associate object-bearing requests with their owner using
+   `observe_request_for_detection(request_id=..., identity_name=...)`.
+4. Call `run_detection_campaign` to generate and drain the ranked authorization
+   queue, or use `generate_idor_hypotheses` for manual control.
+5. The IDOR executor sends an
+   owner baseline, alternate-identity replay, anonymous control, and
+   nonexistent-object control.
+6. Treat only `confirmed_horizontal_idor` as a finding. Confirmation requires
+   the complete four-probe sequence to succeed twice.
+
+Identity secrets stay in Caido. Detection state contains request references
+and authentication fingerprints, not cookies or authorization values.
+
 1. **Build matrix** - Subject × Object × Action matrix (who can do what to which resource)
 2. **Obtain principals** - At least two: owner and non-owner (plus admin/staff if applicable)
 3. **Collect IDs** - Capture at least one valid object ID per principal from list/search/export endpoints

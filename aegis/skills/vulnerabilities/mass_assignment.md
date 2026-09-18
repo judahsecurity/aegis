@@ -112,6 +112,20 @@ Mass assignment binds client-supplied fields directly into models/DTOs without f
 
 ## Testing Methodology
 
+### Aegis Detection Workflow
+
+1. Capture an authenticated JSON or form create/update request and call
+   `list_requests` or `bootstrap_detection_identities` so it enters shared detection state.
+2. Run `generate_authorization_hypotheses` or `run_detection_campaign`.
+3. The detector prioritizes observed privileged fields, then carefully probes inferred
+   fields on authenticated state-changing endpoints.
+4. Each candidate uses baseline, privileged-field mutation, unknown-field, and anonymous
+   controls. A probable result is repeated independently.
+5. Only `confirmed_mass_assignment` is automatically confirmed. It requires the response
+   to reflect the attacker-selected privileged value and both controls to behave differently.
+6. For reporting, obtain a subsequent authoritative read proving persistence; response
+   reflection alone is sufficient for campaign prioritization but not the strongest final PoC.
+
 1. **Identify endpoints** - Create/update endpoints and GraphQL mutations
 2. **Capture responses** - Observe returned fields to build candidate list
 3. **Build sensitive-field dictionary** - Per resource: role, isAdmin, ownerId, status, plan, limits, flags

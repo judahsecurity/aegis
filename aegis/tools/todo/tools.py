@@ -13,6 +13,8 @@ from typing import Any
 
 from agents import RunContextWrapper, function_tool
 
+from aegis.tools.enforcement.tracker import get_tracker
+
 
 logger = logging.getLogger(__name__)
 
@@ -606,10 +608,13 @@ async def track_category_tested(
     test_count: int = 0,
     findings_count: int = 0,
 ) -> str:
-    """Mark a vulnerability testing category as completed WITH evidence.
+    """Mark a vulnerability testing category complete after ledger verification.
 
-    You MUST provide evidence of testing. The system will verify your
-    evidence meets minimum requirements before marking the category.
+    This tool does not create coverage. Security probes must already have been
+    recorded by an execution-backed tool such as ``repeat_request`` or
+    ``record_test_evidence``. The legacy evidence arguments remain for API
+    compatibility but are treated only as a human-readable claim and never as
+    proof that a test occurred.
 
     Call this ONCE per category AFTER you have actually performed testing.
     Do NOT call this multiple times for the same category.
@@ -635,7 +640,10 @@ async def track_category_tested(
         return json.dumps(
             {
                 "success": False,
-                "error": f"Invalid category: {category}. Valid: {', '.join(sorted(_VALID_TEST_CATEGORIES))}",
+                "error": (
+                    f"Invalid category: {category}. Valid: "
+                    f"{', '.join(sorted(_VALID_TEST_CATEGORIES))}"
+                ),
             },
             ensure_ascii=False,
             default=str,
@@ -656,30 +664,13 @@ async def track_category_tested(
         endpoints = []
 
     # Check minimums using TestTracker
-    from aegis.tools.enforcement.tracker import get_tracker
-
     tracker = get_tracker(ctx)
-
-    # Log the tools and endpoints to the tracker (lightweight)
-    for tool in tools[:5]:  # Max 5 tools
-        for endpoint in endpoints[:3]:  # Max 3 endpoints per tool
-            tracker.log_test(
-                category=category,
-                endpoint=endpoint,
-                test_type="evidence",
-                tool=tool,
-            )
 
     passed, missing_reasons = tracker.check_minimums(category)
 
-    # Update tested categories
-    tested = inner.get("tested_categories")
-    if tested is None:
-        tested = set()
-        inner["tested_categories"] = tested
-    elif not isinstance(tested, set):
-        tested = set(tested)
-        inner["tested_categories"] = tested
+    # Completion state is owned by the same persisted ledger as probe evidence.
+    tested = tracker.completed_categories
+    inner["tested_categories"] = tested
 
     already_tested = category in tested
 
@@ -713,14 +704,26 @@ async def track_category_tested(
                     "unique_tests": tracker.get_category_stats(category)["unique_tests"],
                     "unique_endpoints": tracker.get_category_stats(category)["unique_endpoints"],
                     "tools_used": sorted(tracker.get_category_stats(category)["tools_used"]),
+                    "evidence_backed_tests": tracker.get_category_stats(category)[
+                        "evidence_backed_tests"
+                    ],
                 },
+                "note": (
+                    "The tools_used/endpoints_tested arguments do not count as evidence. "
+                    "Record the actual probes first."
+                ),
             },
             ensure_ascii=False,
             default=str,
         )
 
-    tested.add(category)
+    tracker.mark_category_completed(category)
     remaining = _VALID_TEST_CATEGORIES - tested
+
+    # Keep the completion verifier on the same source of truth as the minimum
+    # checker. This is derived from the shared ledger, never caller-supplied.
+    test_evidence = inner.setdefault("test_evidence", {})
+    test_evidence[category] = tracker.category_evidence(category)
 
     return json.dumps(
         {
@@ -731,12 +734,16 @@ async def track_category_tested(
             "remaining": sorted(remaining),
             "minimums_met": True,
             "evidence": {
-                "tools_used": tools,
-                "endpoints_tested": endpoints,
-                "test_count": test_count,
-                "findings_count": findings_count,
+                "ledger": tracker.category_evidence(category),
+                "declared_tools": tools,
+                "declared_endpoints": endpoints,
+                "declared_test_count": test_count,
+                "declared_findings_count": findings_count,
             },
-            "message": f"Category '{category}' marked as tested with evidence. {len(remaining)} categories remaining.",
+            "message": (
+                f"Category '{category}' marked as tested with evidence. "
+                f"{len(remaining)} categories remaining."
+            ),
         },
         ensure_ascii=False,
         default=str,

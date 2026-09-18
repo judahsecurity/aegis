@@ -16,6 +16,18 @@ from agents.tool import CustomTool, FunctionTool, Tool
 from pydantic import ValidationError
 
 from aegis.agents.prompt import render_system_prompt
+from aegis.detection.tools import (
+    bootstrap_detection_identities,
+    execute_authorization_hypothesis,
+    execute_idor_hypothesis,
+    generate_authorization_hypotheses,
+    generate_idor_hypotheses,
+    inspect_campaign_health,
+    inspect_detection_state,
+    observe_request_for_detection,
+    register_test_identity,
+    run_detection_campaign,
+)
 from aegis.tools.agents_graph.tools import (
     agent_finish,
     create_agent,
@@ -24,7 +36,11 @@ from aegis.tools.agents_graph.tools import (
     view_agent_graph,
     wait_for_message,
 )
+from aegis.tools.api_fuzzing.tool import run_api_scan
+from aegis.tools.enforcement.evidence_tool import record_test_evidence
+from aegis.tools.enforcement.verification_agent import verify_category
 from aegis.tools.finish.tool import finish_scan
+from aegis.tools.internal.tool import run_internal_scan
 from aegis.tools.load_skill.tool import load_skill
 from aegis.tools.mobile.apk_analyzer import analyze_apk, decompile_apk
 from aegis.tools.mobile.ipa_analyzer import analyze_ipa
@@ -32,10 +48,10 @@ from aegis.tools.mobile.mobile_secret_scanner import scan_mobile_secrets
 from aegis.tools.mobile.mobile_static_audit import audit_android_manifest, audit_ios_entitlements
 from aegis.tools.mobile.mobsf_integration import (
     mobsf_check_connection,
+    mobsf_delete_scan,
     mobsf_get_report,
     mobsf_get_scorecard,
     mobsf_upload_and_scan,
-    mobsf_delete_scan,
 )
 from aegis.tools.notes.tools import (
     create_note,
@@ -64,9 +80,6 @@ from aegis.tools.todo.tools import (
     update_todo,
 )
 from aegis.tools.web_search.tool import web_search
-from aegis.tools.api_fuzzing.tool import run_api_scan
-from aegis.tools.internal.tool import run_internal_scan
-from aegis.tools.enforcement.verification_agent import verify_category
 
 
 if TYPE_CHECKING:
@@ -408,6 +421,17 @@ _BASE_TOOLS: tuple[Tool, ...] = (
     run_api_scan,
     run_internal_scan,
     verify_category,
+    record_test_evidence,
+    observe_request_for_detection,
+    register_test_identity,
+    inspect_detection_state,
+    inspect_campaign_health,
+    bootstrap_detection_identities,
+    generate_idor_hypotheses,
+    generate_authorization_hypotheses,
+    execute_idor_hypothesis,
+    execute_authorization_hypothesis,
+    run_detection_campaign,
     view_agent_graph,
     send_message_to_agent,
     wait_for_message,

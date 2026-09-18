@@ -56,7 +56,7 @@ async def test_persistent_rate_limit_stops_gracefully(
     monkeypatch.setattr(runner, "build_root_task", lambda _scan_config: "task")
     monkeypatch.setattr(runner, "build_scope_context", lambda _scan_config: "")
     monkeypatch.setattr(runner, "make_model_settings", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(runner, "build_strix_agent", lambda **_kwargs: object())
+    monkeypatch.setattr(runner, "build_aegis_agent", lambda **_kwargs: object())
     monkeypatch.setattr(runner, "make_child_factory", lambda **_kwargs: lambda **_k: object())
     monkeypatch.setattr(runner, "open_agent_session", lambda _root_id, _db: object())
 
@@ -68,7 +68,7 @@ async def test_persistent_rate_limit_stops_gracefully(
     coordinator = AgentCoordinator()
 
     with caplog.at_level(logging.WARNING):
-        result = await runner.run_strix_scan(
+        result = await runner.run_aegis_scan(
             scan_config={"targets": [], "scan_mode": "deep"},
             scan_id="scan-test",
             image="img",
@@ -80,5 +80,5 @@ async def test_persistent_rate_limit_stops_gracefully(
     assert len(root_ids) == 1
     assert coordinator.statuses[root_ids[0]] == "stopped"
     # the resume hint must carry the real scan id, not a literal placeholder
-    assert "strix --resume scan-test" in caplog.text
+    assert "aegis --resume scan-test" in caplog.text
     assert "<run_name>" not in caplog.text

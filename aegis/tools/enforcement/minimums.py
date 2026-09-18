@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+
 # Mandatory categories that MUST be tested before scan can finish
 MANDATORY_CATEGORIES = {
     "auth": "Authentication & Session",
@@ -15,7 +18,7 @@ MANDATORY_CATEGORIES = {
 }
 
 # Minimum requirements per category
-MINIMUM_REQUIREMENTS: dict[str, dict] = {
+MINIMUM_REQUIREMENTS: dict[str, dict[str, Any]] = {
     "auth": {
         "min_unique_tests": 15,
         "min_unique_endpoints": 3,

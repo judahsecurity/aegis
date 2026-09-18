@@ -13,6 +13,9 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from agents import RunContextWrapper, function_tool
 
+from aegis.detection.store import get_detection_store
+from aegis.tools.enforcement.minimums import MANDATORY_CATEGORIES
+from aegis.tools.enforcement.tracker import get_tracker
 from aegis.tools.proxy import caido_api
 
 
@@ -38,6 +41,51 @@ else:
 
 
 ScopeAction = Literal["get", "list", "create", "update", "delete"]
+
+
+def _record_surface_from_result(
+    ctx: RunContextWrapper,
+    *,
+    request_id: str,
+    result: Any,
+    identity_name: str = "",
+    persist: bool = True,
+) -> None:
+    """Best-effort attack-surface ingestion that never breaks proxy access."""
+    try:
+        request = result.request
+        if request.raw is None:
+            return
+        components = caido_api.parse_raw_request(request.raw.decode("utf-8", errors="replace"))
+        response = caido_api.parse_raw_response(
+            result.response.raw if result.response is not None else None
+        )
+        response_headers = response.get("headers", {}) if response else {}
+        response_content_type = next(
+            (
+                str(value)
+                for key, value in response_headers.items()
+                if str(key).lower() == "content-type"
+            ),
+            "",
+        )
+        host = components["headers"].get("Host") or request.host
+        get_detection_store(ctx).observe_request(
+            request_id=request_id,
+            method=components["method"],
+            host=host,
+            url_path=components["url_path"],
+            headers=components["headers"],
+            body=components["body"],
+            identity_name=identity_name,
+            status_code=response.get("status_code") if response else None,
+            response_content_type=response_content_type,
+            persist=persist,
+        )
+    except Exception:  # noqa: BLE001 - surface ingestion must not break proxy tools.
+        logger.debug(
+            "Could not ingest request %s into detection surface", request_id, exc_info=True
+        )
 
 
 def _ctx_client(ctx: RunContextWrapper) -> Client | None:
@@ -236,6 +284,8 @@ async def list_requests(
             )
 
             entries = []
+            request_ids: list[str] = []
+            detection_store = get_detection_store(ctx)
             for edge in connection.edges:
                 req = edge.node.request
                 resp = edge.node.response
@@ -265,6 +315,48 @@ async def list_requests(
                         "response": response_payload,
                     },
                 )
+                request_ids.append(str(req.id))
+                query = str(req.query or "")
+                url_path = str(req.path or "/")
+                if query:
+                    url_path = f"{url_path}?{query}"
+                detection_store.observe_request(
+                    request_id=str(req.id),
+                    method=str(req.method),
+                    host=str(req.host),
+                    url_path=url_path,
+                    headers={},
+                    body="",
+                    status_code=resp.status_code if resp is not None else None,
+                    persist=False,
+                )
+
+            hydration_limit = asyncio.Semaphore(8)
+
+            async def hydrate_request(request_id: str, active_client: Client) -> None:
+                async with hydration_limit:
+                    try:
+                        captured = await caido_api.get_request_with_client(
+                            active_client, request_id, part="request"
+                        )
+                        if captured is not None:
+                            _record_surface_from_result(
+                                ctx,
+                                request_id=request_id,
+                                result=captured,
+                                persist=False,
+                            )
+                    except Exception:  # noqa: BLE001 - listing must remain available.
+                        logger.debug(
+                            "Could not hydrate request %s for detection",
+                            request_id,
+                            exc_info=True,
+                        )
+
+            await asyncio.gather(
+                *(hydrate_request(request_id, client) for request_id in request_ids)
+            )
+            detection_store.flush()
 
             return json.dumps(
                 {
@@ -298,6 +390,7 @@ async def view_request(
     search_pattern: str | None = None,
     page: int = 1,
     page_size: int = 50,
+    identity_name: str = "",
 ) -> str:
     """View a captured request or its response, optionally regex-searched.
 
@@ -323,6 +416,7 @@ async def view_request(
             compact hits.
         page: 1-indexed page number (only when no ``search_pattern``).
         page_size: Lines per page.
+        identity_name: Optional registered identity associated with the request.
     """
     client = _ctx_client(ctx)
     if client is None:
@@ -337,6 +431,19 @@ async def view_request(
                     ensure_ascii=False,
                     default=str,
                 )
+
+            store = get_detection_store(ctx)
+            if identity_name and identity_name not in store.identities:
+                return json.dumps(
+                    {"success": False, "error": f"Identity '{identity_name}' is not registered"},
+                    ensure_ascii=False,
+                )
+            _record_surface_from_result(
+                ctx,
+                request_id=request_id,
+                result=result,
+                identity_name=identity_name,
+            )
 
             raw_bytes = (
                 result.request.raw
@@ -420,6 +527,16 @@ async def repeat_request(
     ctx: RunContextWrapper,
     request_id: str,
     modifications: dict[str, Any] | None = None,
+    category: str | None = None,
+    endpoint_template: str = "",
+    sub_category: str = "",
+    test_type: str = "",
+    parameter: str = "",
+    payload_family: str = "",
+    auth_context: str = "anonymous",
+    oracle: str = "response-differential",
+    finding: bool = False,
+    no_vulnerability_observed: bool = False,
 ) -> str:
     """Repeat a captured request, optionally patching individual fields.
 
@@ -445,7 +562,45 @@ async def repeat_request(
             - ``headers`` — dict of headers to add/update.
             - ``body`` — replace the body string entirely.
             - ``cookies`` — dict of cookies to add/update.
+        category: Optional mandatory coverage category. When supplied, this
+            replay is added to the shared evidence ledger after it executes.
+        endpoint_template: Stable route identity such as ``/users/{id}``.
+            Defaults to the original captured URL with its query removed.
+        sub_category: Specific weakness family, such as ``idor`` or ``sqli``.
+        test_type: Short description of the security hypothesis tested.
+        parameter: Input or object reference changed by the probe.
+        payload_family: Payload technique rather than the literal payload.
+        auth_context: Identity or role used for the replay.
+        oracle: Observation used to decide the result.
+        finding: Whether the replay confirmed a vulnerability.
+        no_vulnerability_observed: Whether it completed without confirming one.
     """
+    if category is not None and category not in MANDATORY_CATEGORIES:
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Invalid category: {category}",
+                "valid_categories": sorted(MANDATORY_CATEGORIES),
+            },
+            ensure_ascii=False,
+        )
+    if category is not None and not test_type.strip():
+        return json.dumps(
+            {
+                "success": False,
+                "error": "test_type is required when category is supplied",
+            },
+            ensure_ascii=False,
+        )
+    if finding and no_vulnerability_observed:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "A replay cannot be both a finding and a negative observation",
+            },
+            ensure_ascii=False,
+        )
+
     client = _ctx_client(ctx)
     if client is None:
         return _no_client()
@@ -462,6 +617,14 @@ async def repeat_request(
                 )
 
             original = result.request
+            detection_store = get_detection_store(ctx)
+            observed_identity = auth_context if auth_context in detection_store.identities else ""
+            _record_surface_from_result(
+                ctx,
+                request_id=request_id,
+                result=result,
+                identity_name=observed_identity,
+            )
             raw_str = result.request.raw.decode("utf-8", errors="replace")
             components = caido_api.parse_raw_request(raw_str)
             full_url = caido_api.full_url_from_components(original, components, mods)
@@ -473,7 +636,41 @@ async def repeat_request(
                 body=modified["body"],
             )
             replay = await caido_api.replay_send_raw(client, raw=raw, connection=connection)
-            return _format_replay_tool_result(replay)
+            payload = _format_replay_tool_result(replay)
+            if category is not None:
+                response = payload.get("response")
+                if payload["success"] and isinstance(response, dict):
+                    event = get_tracker(ctx).log_test(
+                        category=category,
+                        endpoint=endpoint_template or full_url,
+                        test_type=test_type,
+                        tool="repeat_request",
+                        sub_category=sub_category,
+                        payload=json.dumps(
+                            mods,
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                        parameter=parameter,
+                        payload_family=payload_family,
+                        auth_context=auth_context,
+                        oracle=oracle,
+                        evidence_ref=f"caido:replay:{replay['session_id']}",
+                        status_code=response.get("status_code"),
+                        finding=finding,
+                        no_vulnerability_observed=no_vulnerability_observed,
+                    )
+                    payload["coverage_event"] = {
+                        "event_id": event["event_id"],
+                        "created": event["created"],
+                        "category": event["category"],
+                    }
+                else:
+                    payload["coverage_error"] = (
+                        "Replay did not produce a parseable response and was not counted"
+                    )
+            return json.dumps(payload, ensure_ascii=False, default=str)
         except Exception as exc:  # noqa: BLE001
             if attempt == 0 and _is_network_error(exc):
                 logger.info("Caido connection stale, reconnecting (attempt %d)", attempt + 1)
@@ -482,9 +679,10 @@ async def repeat_request(
                     return _err("repeat_request", exc)
                 continue
             return _err("repeat_request", exc)
+    return _err("repeat_request", RuntimeError("Replay attempts exhausted"))
 
 
-def _format_replay_tool_result(replay: dict[str, Any]) -> str:
+def _format_replay_tool_result(replay: dict[str, Any]) -> dict[str, Any]:
     response = caido_api.parse_raw_response(replay.get("response_raw"))
     payload: dict[str, Any] = {
         "success": replay["status"] == "DONE",
@@ -495,7 +693,7 @@ def _format_replay_tool_result(replay: dict[str, Any]) -> str:
     }
     if replay.get("error"):
         payload["error"] = replay["error"]
-    return json.dumps(payload, ensure_ascii=False, default=str)
+    return payload
 
 
 @function_tool(timeout=60)
