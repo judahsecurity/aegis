@@ -703,7 +703,10 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
 
     scan_completed = False
     if report_state:
-        scan_completed = report_state.run_record.get("status") == "completed"
+        scan_completed = report_state.run_record.get("status") in {
+            "completed",
+            "completed_with_budget_limit",
+        }
 
     completion_text = Text()
     if scan_completed:

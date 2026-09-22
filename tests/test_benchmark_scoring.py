@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from aegis.detection.scoring import aggregate_cohort, grade_run
+from aegis.detection.scoring import (
+    aggregate_cohort,
+    collect_run_output,
+    grade_run,
+    grade_run_directory,
+)
 
 
 if TYPE_CHECKING:
@@ -66,3 +71,29 @@ def test_secure_control_confirmation_is_scored_as_false_positive(tmp_path: Path)
     assert cohort["vulnerable_solve_rate"] == 1.0
     assert cohort["secure_controls_passed"] == 0
     assert cohort["average_elapsed_seconds"] == 15.0
+
+
+def test_run_directory_grading_uses_only_result_artifacts(tmp_path: Path) -> None:
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    record = state_dir / "benchmark_run.json"
+    _record(record, confirmed=1, elapsed=10.0)
+    (tmp_path / "vulnerabilities.json").write_text(
+        '[{"proof":"FLAG{expected-secret}"}]',
+        encoding="utf-8",
+    )
+    # The grader must not search internal/session files, where a benchmark
+    # value could appear without the agent actually reporting it.
+    (state_dir / "agent-not-output.txt").write_text(
+        "FLAG{internal-only}",
+        encoding="utf-8",
+    )
+
+    grade = grade_run_directory(
+        tmp_path,
+        expected_value="FLAG{expected-secret}",
+    )
+
+    assert grade["solved"] is True
+    assert "FLAG{internal-only}" not in collect_run_output(tmp_path)
+    assert "FLAG{expected-secret}" not in record.read_text(encoding="utf-8")

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any
 
 from agents.lifecycle import RunHooks
 
+from aegis.detection.evidence import assess_http_evidence
 from aegis.report.state import get_global_report_state
 
 
@@ -23,12 +25,17 @@ class BudgetExceededError(RuntimeError):
     """Raised when the accumulated LLM cost reaches the configured budget."""
 
 
+class BudgetFinalizationRequiredError(BudgetExceededError):
+    """Raised when findings exist and the reserved finalization budget is reached."""
+
+
 class ReportUsageHooks(RunHooks[dict[str, Any]]):
     """Persist SDK-native usage after every model response."""
 
     def __init__(self, *, model: str, max_budget_usd: float | None = None) -> None:
-        import math
-        if max_budget_usd is not None and (not math.isfinite(max_budget_usd) or max_budget_usd <= 0):
+        if max_budget_usd is not None and (
+            not math.isfinite(max_budget_usd) or max_budget_usd <= 0
+        ):
             raise ValueError("max_budget_usd must be a finite number greater than 0")
         self._model = model
         self._max_budget_usd = max_budget_usd
@@ -63,6 +70,27 @@ class ReportUsageHooks(RunHooks[dict[str, Any]]):
 
         if self._max_budget_usd is not None:
             cost = report_state.get_total_llm_cost()
+            reports = getattr(report_state, "vulnerability_reports", None)
+            has_verified_findings = isinstance(reports, list) and any(
+                (
+                    isinstance(report.get("evidence_assessment"), dict)
+                    and report["evidence_assessment"].get("level") == "verified"
+                )
+                or assess_http_evidence(
+                    report.get("http_requests")
+                    if isinstance(report.get("http_requests"), list)
+                    else None
+                ).level
+                == "verified"
+                for report in reports
+                if isinstance(report, dict)
+            )
+            reserve_threshold = self._max_budget_usd * 0.9
+            if has_verified_findings and cost >= reserve_threshold:
+                raise BudgetFinalizationRequiredError(
+                    f"Finding-preservation threshold of ${reserve_threshold:.2f} reached "
+                    f"(spent ${cost:.4f}; hard limit ${self._max_budget_usd:.2f})"
+                )
             if cost >= self._max_budget_usd:
                 raise BudgetExceededError(
                     f"Token budget of ${self._max_budget_usd:.2f} exceeded (spent ${cost:.4f})"

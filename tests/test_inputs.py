@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from aegis.core.inputs import build_root_task, child_initial_input
+from aegis.core.inputs import build_root_task, child_initial_input, make_model_settings
 
 
 def _child_kwargs(parent_history: list[Any]) -> dict[str, Any]:
@@ -112,3 +112,23 @@ def test_build_root_task_diff_scope() -> None:
     assert "Scope Constraints:" in task
     assert "3 changed file(s)" in task
     assert "2 deleted file(s)" in task
+
+
+def test_anthropic_model_enables_stable_prompt_cache_breakpoint() -> None:
+    settings = make_model_settings(None, model_name="anthropic/claude-opus-4-8")
+
+    assert settings.extra_args == {
+        "cache_control_injection_points": [
+            {
+                "location": "message",
+                "role": "system",
+                "control": {"type": "ephemeral"},
+            }
+        ]
+    }
+
+
+def test_non_anthropic_model_does_not_receive_anthropic_cache_args() -> None:
+    settings = make_model_settings(None, model_name="deepseek/deepseek-chat")
+
+    assert settings.extra_args is None

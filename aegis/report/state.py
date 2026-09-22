@@ -9,6 +9,7 @@ from uuid import uuid4
 from agents.usage import Usage
 
 from aegis.core.paths import run_dir_for
+from aegis.redaction import redact_sensitive_data, redact_sensitive_text
 from aegis.report.usage import LLMUsageLedger
 from aegis.report.writer import (
     read_run_record,
@@ -20,6 +21,8 @@ from aegis.telemetry import posthog, scarf
 
 
 logger = logging.getLogger(__name__)
+
+_TERMINAL_STATUSES = {"completed", "completed_with_budget_limit"}
 
 _global_report_state: Optional["ReportState"] = None
 
@@ -126,10 +129,13 @@ class ReportState:
                 raise RuntimeError(
                     f"vulnerabilities.json at {json_path} is not a list",
                 )
-            self.vulnerability_reports = [r for r in data if isinstance(r, dict)]
-            for r in self.vulnerability_reports:
-                rid = r.get("id")
-                if isinstance(rid, str):
+            raw_reports = [r for r in data if isinstance(r, dict)]
+            self.vulnerability_reports = [redact_sensitive_data(r) for r in raw_reports]
+            for raw_report, report in zip(raw_reports, self.vulnerability_reports, strict=True):
+                rid = report.get("id")
+                # If hydration removed a secret, leave the id unsaved so the
+                # next artifact flush also rewrites the Markdown copy.
+                if isinstance(rid, str) and raw_report == report:
                     self._saved_vuln_ids.add(rid)
             logger.info(
                 "report state hydrated %d vulnerability report(s)",
@@ -162,6 +168,19 @@ class ReportState:
         decompiled_file: str | None = None,
         device_required: bool | None = None,
     ) -> str:
+        title = redact_sensitive_text(title)
+        description = redact_sensitive_text(description) if description else None
+        impact = redact_sensitive_text(impact) if impact else None
+        target = redact_sensitive_text(target) if target else None
+        technical_analysis = (
+            redact_sensitive_text(technical_analysis) if technical_analysis else None
+        )
+        poc_description = redact_sensitive_text(poc_description) if poc_description else None
+        poc_script_code = redact_sensitive_text(poc_script_code) if poc_script_code else None
+        remediation_steps = (
+            redact_sensitive_text(remediation_steps) if remediation_steps else None
+        )
+        code_locations = redact_sensitive_data(code_locations) if code_locations else None
         report_id = f"vuln-{len(self.vulnerability_reports) + 1:04d}"
 
         report: dict[str, Any] = {
@@ -230,14 +249,17 @@ class ReportState:
         report_id: str,
         http_requests: list[dict[str, Any]] | None = None,
         screenshot_files: list[dict[str, str]] | None = None,
+        evidence_assessment: dict[str, Any] | None = None,
     ) -> None:
         """Attach evidence references to an existing vulnerability report."""
         for report in self.vulnerability_reports:
             if report.get("id") == report_id:
                 if http_requests:
-                    report["http_requests"] = http_requests
+                    report["http_requests"] = redact_sensitive_data(http_requests)
                 if screenshot_files:
-                    report["screenshot_files"] = screenshot_files
+                    report["screenshot_files"] = redact_sensitive_data(screenshot_files)
+                if evidence_assessment:
+                    report["evidence_assessment"] = redact_sensitive_data(evidence_assessment)
                 self.save_run_data()
                 logger.info("Updated evidence for %s", report_id)
                 return
@@ -297,6 +319,57 @@ class ReportState:
         posthog.end(self, exit_reason="finished_by_tool")
         scarf.end(self, exit_reason="finished_by_tool")
 
+    def finalize_from_persisted_findings(
+        self,
+        *,
+        completed_categories: list[str] | None = None,
+    ) -> None:
+        """Write a deterministic terminal report when the LLM budget is reserved.
+
+        This path uses only already-persisted findings. It does not ask the
+        model for another summary, so a verified result cannot be lost while
+        trying to spend the final budget on prose.
+        """
+        reports = list(self.vulnerability_reports)
+        if not reports:
+            return
+        finding_lines = []
+        recommendation_lines = []
+        for report in reports:
+            title = str(report.get("title") or "Security finding").strip()
+            severity = str(report.get("severity") or "unknown").strip().title()
+            endpoint = str(report.get("endpoint") or report.get("target") or "target").strip()
+            finding_lines.append(f"- {severity}: {title} ({endpoint})")
+            remediation = str(report.get("remediation_steps") or "").strip()
+            if remediation:
+                recommendation_lines.append(f"- {title}: {remediation}")
+        category_text = ", ".join(sorted(completed_categories or [])) or "partial"
+        self.scan_results = {
+            "scan_completed": True,
+            "completion_reason": "budget_limit_after_findings",
+            "coverage_complete": False,
+            "executive_summary": (
+                f"The assessment identified {len(reports)} exploitable security "
+                "finding(s). Results and reproduction evidence were preserved before "
+                "the configured assessment budget was exhausted."
+            ),
+            "methodology": (
+                "Authorized application testing combined endpoint discovery, controlled "
+                "request replay, identity-aware comparisons, and negative controls. "
+                f"Completed coverage categories at finalization: {category_text}."
+            ),
+            "technical_analysis": "Confirmed findings:\n" + "\n".join(finding_lines),
+            "recommendations": (
+                "Prioritize the confirmed findings, deploy fixes, and perform a focused "
+                "retest.\n" + "\n".join(recommendation_lines)
+            ),
+            "success": True,
+            "vulnerability_count": len(reports),
+        }
+        self.final_scan_result = self._format_final_scan_result(self.scan_results)
+        self.run_record["scan_results"] = self.scan_results
+        self.save_run_data(status="completed_with_budget_limit")
+
     def set_scan_config(self, config: dict[str, Any]) -> None:
         self.scan_config = config
         self.run_record["status"] = "running"
@@ -323,7 +396,7 @@ class ReportState:
             self.end_time = datetime.now(UTC).isoformat()
             self.run_record["end_time"] = self.end_time
             self.run_record["status"] = "completed"
-        elif status and self.run_record.get("status") != "completed":
+        elif status and self.run_record.get("status") not in _TERMINAL_STATUSES:
             current_status = self.run_record.get("status")
             if status == "stopped" and current_status in {"failed", "interrupted"}:
                 status = str(current_status)

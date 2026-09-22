@@ -10,6 +10,9 @@ from typing import Any
 
 from agents import RunContextWrapper, function_tool
 
+from aegis.detection.evidence import assess_http_evidence
+from aegis.redaction import redact_sensitive_data, redact_sensitive_text
+
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +154,108 @@ _REQUIRED_FIELDS = {
 }
 
 
-async def _do_create(  # noqa: PLR0912
+def _merge_http_evidence(
+    supplied: list[dict[str, Any]] | None,
+    captured: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Prefer finding-specific evidence and append unique proxy context."""
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*(supplied or []), *(captured or [])]:
+        if not isinstance(item, dict):
+            continue
+        fingerprint = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        merged.append(item)
+        if len(merged) >= 10:
+            break
+    return merged
+
+
+async def _capture_recent_http(ctx: dict[str, Any], title: str) -> list[dict[str, Any]]:
+    """Best-effort recent traffic capture while retaining the client that worked."""
+    from aegis.tools.proxy import caido_api
+
+    clients: list[Any] = []
+    context_client = ctx.get("caido_client")
+    if context_client is not None:
+        clients.append(context_client)
+    try:
+        fresh_client = await caido_api.get_client()
+        if fresh_client is not context_client:
+            clients.append(fresh_client)
+    except Exception as exc:  # noqa: BLE001 - supplied evidence remains available.
+        logger.debug("Could not create a fresh Caido evidence client: %s", exc)
+
+    list_result: Any = None
+    working_client: Any = None
+    for candidate in clients:
+        try:
+            list_result = await caido_api.list_requests_with_client(candidate, first=10)
+            working_client = candidate
+            break
+        except Exception as exc:  # noqa: BLE001 - try the next connection.
+            logger.debug("Caido evidence client is unavailable: %s", exc)
+    if list_result is None or working_client is None:
+        return []
+
+    captured: list[dict[str, Any]] = []
+    edges = list_result.edges if hasattr(list_result, "edges") else []
+    for edge in edges[:5]:
+        node = edge.node if hasattr(edge, "node") else None
+        request_id = getattr(node, "id", None) if node is not None else None
+        if not request_id:
+            continue
+        try:
+            full = await caido_api.get_request_with_client(
+                working_client,
+                str(request_id),
+                part="request",
+            )
+            if full is None:
+                continue
+            request_obj = full.request if hasattr(full, "request") else None
+            response_obj = full.response if hasattr(full, "response") else None
+            req_raw = request_obj.raw if request_obj is not None else None
+            resp_raw = response_obj.raw if response_obj is not None else None
+            parsed_req = (
+                caido_api.parse_raw_request(
+                    req_raw.decode("utf-8", errors="replace")
+                    if isinstance(req_raw, bytes)
+                    else str(req_raw or "")
+                )
+                if req_raw
+                else None
+            )
+            parsed_resp = caido_api.parse_raw_response(resp_raw) if resp_raw else None
+            if not parsed_req or not parsed_resp:
+                continue
+            host = getattr(request_obj, "host", "")
+            path = getattr(request_obj, "path", "")
+            captured.append(
+                {
+                    "request": {
+                        "method": parsed_req.get("method", "GET"),
+                        "url": f"{host}{path}",
+                        "headers": parsed_req.get("headers", {}),
+                        "body": parsed_req.get("body", ""),
+                    },
+                    "response": {
+                        "status_code": parsed_resp.get("status_code", 0),
+                        "headers": parsed_resp.get("headers", {}),
+                        "body": parsed_resp.get("body", ""),
+                    },
+                    "description": f"Captured HTTP traffic for {title}",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001 - one bad request must not lose the report.
+            logger.debug("Failed to fetch full request %s: %s", request_id, exc)
+    return captured
+
+
+async def _do_create(  # noqa: PLR0912, PLR0915
     *,
     title: str,
     description: str,
@@ -231,14 +335,22 @@ async def _do_create(  # noqa: PLR0912
         from aegis.report.dedupe import check_duplicate
 
         existing = report_state.get_existing_vulnerabilities()
+        safe_title = redact_sensitive_text(title)
+        safe_description = redact_sensitive_text(description)
+        safe_impact = redact_sensitive_text(impact)
+        safe_target = redact_sensitive_text(target)
+        safe_analysis = redact_sensitive_text(technical_analysis)
+        safe_poc_description = redact_sensitive_text(poc_description)
+        safe_poc_code = redact_sensitive_text(poc_script_code)
+        safe_remediation = redact_sensitive_text(remediation_steps)
         candidate = {
-            "title": title,
-            "description": description,
-            "impact": impact,
-            "target": target,
-            "technical_analysis": technical_analysis,
-            "poc_description": poc_description,
-            "poc_script_code": poc_script_code,
+            "title": safe_title,
+            "description": safe_description,
+            "impact": safe_impact,
+            "target": safe_target,
+            "technical_analysis": safe_analysis,
+            "poc_description": safe_poc_description,
+            "poc_script_code": safe_poc_code,
             "endpoint": endpoint,
             "method": method,
         }
@@ -262,15 +374,15 @@ async def _do_create(  # noqa: PLR0912
             }
 
         report_id = report_state.add_vulnerability_report(
-            title=title,
-            description=description,
+            title=safe_title,
+            description=safe_description,
             severity=severity,
-            impact=impact,
-            target=target,
-            technical_analysis=technical_analysis,
-            poc_description=poc_description,
-            poc_script_code=poc_script_code,
-            remediation_steps=remediation_steps,
+            impact=safe_impact,
+            target=safe_target,
+            technical_analysis=safe_analysis,
+            poc_description=safe_poc_description,
+            poc_script_code=safe_poc_code,
+            remediation_steps=safe_remediation,
             cvss=cvss_score,
             cvss_breakdown=cvss_breakdown,
             endpoint=endpoint,
@@ -281,11 +393,10 @@ async def _do_create(  # noqa: PLR0912
             agent_id=agent_id if isinstance(agent_id, str) else None,
             agent_name=agent_name if isinstance(agent_name, str) else None,
         )
-        
+
         # Auto-capture evidence from Caido proxy
         try:
             from aegis.tools.evidence_capture import get_evidence_capture
-            from aegis.tools.proxy import caido_api
 
             ctx = inner_context or {}
             caido_client = ctx.get("caido_client")
@@ -300,109 +411,23 @@ async def _do_create(  # noqa: PLR0912
             run_dir = report_state.get_run_dir()
             evidence = get_evidence_capture(str(run_dir))
 
-            # AUTOMATICALLY capture HTTP traffic from Caido with full headers/body
-            auto_http_requests: list[dict[str, Any]] = []
-            try:
-                caido_client = ctx.get("caido_client")
-                # Try context client first, fall back to fresh connection
-                clients_to_try = [caido_client] if caido_client else []
-                clients_to_try.append(None)  # None = use get_client() fallback
-
-                list_result = None
-                for client_candidate in clients_to_try:
-                    if list_result is not None:
-                        break
-                    for _attempt in range(2):
-                        try:
-                            if client_candidate is not None:
-                                logger.debug("Trying context caido_client (attempt %d)", _attempt)
-                                list_result = await caido_api.list_requests_with_client(
-                                    client_candidate, first=10,
-                                )
-                            else:
-                                logger.debug("Trying fresh caido_api.get_client() (attempt %d)", _attempt)
-                                fresh = await caido_api.get_client()
-                                list_result = await caido_api.list_requests_with_client(
-                                    fresh, first=10,
-                                )
-                            logger.debug("Caido list_requests succeeded, edges=%d", len(list_result.edges) if hasattr(list_result, "edges") else 0)
-                            break
-                        except Exception as exc:
-                            logger.debug("Caido attempt %d failed: %s", _attempt, exc)
-                            if _attempt == 0:
-                                continue
-                            # Mark this client as dead, try next
-                            client_candidate = None
-
-                if list_result is not None:
-                    # Determine which client worked
-                    working_client = ctx.get("caido_client")
-                    try:
-                        working_client = await caido_api.get_client()
-                    except Exception:
-                        pass
-
-                    edges = list_result.edges if hasattr(list_result, "edges") else []
-                    # Fetch full request+response for each (up to 5)
-                    for edge in edges[:5]:
-                        node = edge.node if hasattr(edge, "node") else None
-                        if node is None:
-                            continue
-                        request_id = getattr(node, "id", None)
-                        if not request_id:
-                            continue
-                        try:
-                            full = await caido_api.get_request_with_client(
-                                working_client, str(request_id), part="request",
-                            )
-                            if full is None:
-                                continue
-                            # Parse raw bytes into structured dicts
-                            req_raw = full.request.raw if hasattr(full, "request") and full.request else None
-                            resp_raw = (
-                                full.response.raw
-                                if hasattr(full, "response") and full.response
-                                else None
-                            )
-                            parsed_req = caido_api.parse_raw_request(
-                                req_raw.decode("utf-8", errors="replace") if isinstance(req_raw, bytes) else str(req_raw or "")
-                            ) if req_raw else None
-                            parsed_resp = caido_api.parse_raw_response(resp_raw) if resp_raw else None
-                            if parsed_req and parsed_resp:
-                                host = getattr(full.request, "host", "") if hasattr(full, "request") and full.request else ""
-                                path = getattr(full.request, "path", "") if hasattr(full, "request") and full.request else ""
-                                url = f"{host}{path}"
-                                auto_http_requests.append({
-                                    "request": {
-                                        "method": parsed_req.get("method", "GET"),
-                                        "url": url,
-                                        "headers": parsed_req.get("headers", {}),
-                                        "body": parsed_req.get("body", ""),
-                                    },
-                                    "response": {
-                                        "status_code": parsed_resp.get("status_code", 0),
-                                        "headers": parsed_resp.get("headers", {}),
-                                        "body": parsed_resp.get("body", ""),
-                                    },
-                                    "description": f"Captured HTTP traffic for {title}",
-                                })
-                        except Exception:
-                            logger.debug("Failed to fetch full request %s", request_id, exc_info=True)
-            except Exception as exc:
-                logger.debug("Could not auto-capture HTTP traffic: %s", exc)
-
-            # Merge: auto-captured first (better quality), then agent-provided
-            all_requests = auto_http_requests[:5] + (http_requests or [])
+            auto_http_requests = await _capture_recent_http(ctx, safe_title)
+            # Agent-supplied evidence is tied to the finding. Recent proxy
+            # traffic is supplemental and must never displace it.
+            all_requests = _merge_http_evidence(http_requests, auto_http_requests)
+            assessment = assess_http_evidence(all_requests)
+            safe_requests = redact_sensitive_data(all_requests)
             logger.debug(
-                "Evidence merge: auto=%d, agent=%d, total=%d",
-                len(auto_http_requests),
+                "Evidence merge: agent=%d, auto=%d, total=%d, level=%s",
                 len(http_requests) if http_requests else 0,
+                len(auto_http_requests),
                 len(all_requests),
+                assessment.level,
             )
 
             # Save HTTP request/response evidence
-            if all_requests:
-                for req in all_requests:
+            if safe_requests:
+                for req in safe_requests:
                     evidence.save_http_evidence(
                         report_id,
                         request=req.get("request", {}),
@@ -426,29 +451,66 @@ async def _do_create(  # noqa: PLR0912
                     })
 
             # Save PoC code
-            if poc_script_code:
-                evidence.save_poc(report_id, poc_script_code, "python")
+            if safe_poc_code:
+                evidence.save_poc(report_id, safe_poc_code, "python")
 
             # Save findings summary
             evidence.save_findings_summary(report_id, {
-                "title": title,
+                "title": safe_title,
                 "severity": severity,
                 "cvss": cvss_score,
-                "target": target,
+                "target": safe_target,
                 "endpoint": endpoint,
             })
 
             # Store evidence refs in the report for markdown rendering
-            if all_requests or screenshot_paths:
+            if safe_requests or screenshot_paths:
                 report_state.update_vulnerability_evidence(
                     report_id,
-                    http_requests=all_requests if all_requests else None,
+                    http_requests=safe_requests if safe_requests else None,
                     screenshot_files=screenshot_paths if screenshot_paths else None,
+                    evidence_assessment=assessment.to_dict(),
                 )
 
-        except Exception as exc:
+            # Reconcile the report with the scan-wide detection campaign. A
+            # 2xx/3xx differential by itself never promotes a hypothesis.
+            from aegis.detection.store import DetectionStore
+
+            detection_store = ctx.get("_detection_store")
+            if isinstance(detection_store, DetectionStore):
+                detection_store.reconcile_report(
+                    report_id=report_id,
+                    endpoint=endpoint or target,
+                    method=method or "GET",
+                    assessment=assessment,
+                )
+
+            from aegis.detection.benchmark import BenchmarkRunRecorder
+
+            benchmark_recorder = ctx.get("_benchmark_recorder")
+            if isinstance(benchmark_recorder, BenchmarkRunRecorder):
+                benchmark_recorder.mark_stage(
+                    "validation",
+                    detail=f"Report {report_id} evidence graded {assessment.level}",
+                    evidence_ref=f"vulnerabilities.json#{report_id}",
+                )
+                benchmark_recorder.update_metrics(
+                    {
+                        "reported_findings": len(report_state.vulnerability_reports),
+                        "verified_report_findings": sum(
+                            bool(item.get("verified"))
+                            for item in (
+                                detection_store.promoted_findings.values()
+                                if isinstance(detection_store, DetectionStore)
+                                else []
+                            )
+                        ),
+                    }
+                )
+
+        except Exception as exc:  # noqa: BLE001 - report remains persisted.
             logger.warning("Failed to save evidence: %s", exc)
-        
+
     except (ImportError, AttributeError) as e:
         logger.exception("create_vulnerability_report persistence failed")
         return {"success": False, "error": f"Failed to create vulnerability report: {e!s}"}

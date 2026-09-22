@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from aegis.detection.evidence import EvidenceAssessment, normalize_route
 from aegis.detection.extractor import (
     auth_headers,
     content_type,
@@ -48,6 +49,7 @@ class DetectionStore:
         self.endpoints: dict[str, EndpointRecord] = {}
         self.identities: dict[str, IdentityRecord] = {}
         self.hypotheses: dict[str, HypothesisRecord] = {}
+        self.promoted_findings: dict[str, dict[str, Any]] = {}
         self.campaign_events: list[dict[str, Any]] = []
         self._storage_path = storage_path
         self._lock = threading.RLock()
@@ -75,6 +77,11 @@ class DetectionStore:
                 for key, value in payload.get("hypotheses", {}).items()
                 if isinstance(value, dict)
             }
+            self.promoted_findings = {
+                str(key): dict(value)
+                for key, value in payload.get("promoted_findings", {}).items()
+                if isinstance(value, dict)
+            }
             self.campaign_events = [
                 dict(item) for item in payload.get("campaign_events", []) if isinstance(item, dict)
             ][-500:]
@@ -90,7 +97,7 @@ class DetectionStore:
             self._storage_path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(
                 {
-                    "version": 2,
+                    "version": 3,
                     "endpoints": {
                         key: endpoint.to_dict() for key, endpoint in self.endpoints.items()
                     },
@@ -100,6 +107,7 @@ class DetectionStore:
                     "hypotheses": {
                         key: hypothesis.to_dict() for key, hypothesis in self.hypotheses.items()
                     },
+                    "promoted_findings": self.promoted_findings,
                     "campaign_events": self.campaign_events[-500:],
                 },
                 ensure_ascii=False,
@@ -496,6 +504,62 @@ class DetectionStore:
             self._persist()
             return HypothesisRecord.from_dict(hypothesis.to_dict())
 
+    def reconcile_report(
+        self,
+        *,
+        report_id: str,
+        endpoint: str,
+        method: str,
+        assessment: EvidenceAssessment,
+    ) -> list[HypothesisRecord]:
+        """Promote matching hypotheses only when report evidence is verified.
+
+        The report itself is retained as a scan finding regardless of this
+        internal classification. This method only controls detection-campaign
+        truth, so an HTTP status differential alone remains inconclusive.
+        """
+        if not report_id:
+            return []
+        normalized_method = str(method or "GET").upper()
+        normalized_route = normalize_route(endpoint)
+        updated: list[HypothesisRecord] = []
+        with self._lock:
+            self.promoted_findings[report_id] = {
+                "report_id": report_id,
+                "method": normalized_method,
+                "route": normalized_route,
+                "evidence": assessment.to_dict(),
+                "verified": assessment.level == "verified",
+                "updated_at": time.time(),
+            }
+            for hypothesis in self.hypotheses.values():
+                key_parts = hypothesis.endpoint_key.split(" ", 1)
+                if len(key_parts) != 2 or key_parts[0].upper() != normalized_method:
+                    continue
+                hypothesis_route = key_parts[1]
+                slash_index = hypothesis_route.find("/")
+                if slash_index >= 0:
+                    hypothesis_route = hypothesis_route[slash_index:]
+                if normalize_route(hypothesis_route) != normalized_route:
+                    continue
+                status: HypothesisStatus = (
+                    "confirmed" if assessment.level == "verified" else "inconclusive"
+                )
+                hypothesis.status = status
+                hypothesis.result = {
+                    "report_id": report_id,
+                    "evidence_level": assessment.level,
+                    "evidence": assessment.to_dict(),
+                }
+                self._record_event(
+                    "report_evidence_reconciled",
+                    axis=f"{hypothesis.hypothesis_type}:{hypothesis.endpoint_key}",
+                    state_changed=status == "confirmed",
+                )
+                updated.append(HypothesisRecord.from_dict(hypothesis.to_dict()))
+            self._persist()
+        return updated
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -509,6 +573,7 @@ class DetectionStore:
                         reverse=True,
                     )
                 ],
+                "promoted_findings": list(self.promoted_findings.values()),
                 "campaign_health": self.campaign_health(),
             }
 
@@ -576,6 +641,9 @@ class DetectionStore:
                     status: sum(1 for item in self.hypotheses.values() if item.status == status)
                     for status in ("queued", "running", "confirmed", "rejected", "inconclusive")
                 },
+                "verified_findings": sum(
+                    bool(item.get("verified")) for item in self.promoted_findings.values()
+                ),
                 "high_priority_open": sum(
                     item.status in {"queued", "running"} and item.priority >= 0.75
                     for item in self.hypotheses.values()

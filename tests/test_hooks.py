@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from aegis.core.hooks import BudgetExceededError, ReportUsageHooks
+from aegis.core.hooks import (
+    BudgetExceededError,
+    BudgetFinalizationRequiredError,
+    ReportUsageHooks,
+)
 
 
 def _make_hooks(max_budget: float | None) -> ReportUsageHooks:
@@ -106,3 +110,29 @@ def test_non_positive_budget_rejected(bad_budget: float) -> None:
 def test_budget_exceeded_error_is_runtime_error() -> None:
     err = BudgetExceededError("test")
     assert isinstance(err, RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_findings_use_reserved_budget_for_deterministic_finalization() -> None:
+    hooks = _make_hooks(10.0)
+    state = _make_report_state(9.0)
+    state.vulnerability_reports = [
+        {"id": "vuln-0001", "evidence_assessment": {"level": "verified"}}
+    ]
+    with (
+        patch("aegis.core.hooks.get_global_report_state", return_value=state),
+        pytest.raises(BudgetFinalizationRequiredError),
+    ):
+        await hooks.on_llm_end(_make_context(), MagicMock(), MagicMock())
+
+
+@pytest.mark.asyncio
+async def test_unverified_report_does_not_trigger_early_finalization() -> None:
+    hooks = _make_hooks(10.0)
+    state = _make_report_state(9.5)
+    state.vulnerability_reports = [
+        {"id": "vuln-0001", "evidence_assessment": {"level": "insufficient"}}
+    ]
+
+    with patch("aegis.core.hooks.get_global_report_state", return_value=state):
+        await hooks.on_llm_end(_make_context(), MagicMock(), MagicMock())

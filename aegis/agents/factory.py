@@ -28,6 +28,7 @@ from aegis.detection.tools import (
     register_test_identity,
     run_detection_campaign,
 )
+from aegis.redaction import redact_sensitive_text
 from aegis.tools.agents_graph.tools import (
     agent_finish,
     create_agent,
@@ -265,7 +266,7 @@ def _wrap_exec_command(tool: FunctionTool) -> FunctionTool:
                 logger.debug(
                     "Tool log: run_dir=%s, command=%s",
                     run_dir,
-                    command[:50] if command else "empty",
+                    redact_sensitive_text(command[:50]) if command else "empty",
                 )
 
                 if run_dir and command:

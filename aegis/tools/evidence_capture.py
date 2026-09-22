@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 
+from aegis.redaction import redact_sensitive_data, redact_sensitive_text
+
 
 class EvidenceCapture:
     """Captures and organizes evidence for vulnerabilities."""
@@ -24,6 +26,7 @@ class EvidenceCapture:
         self.scan_dir = Path(scan_dir)
         self.evidence_dir = self.scan_dir / "evidence"
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
+        self.evidence_dir.chmod(0o700)
     
     def create_vuln_evidence_dir(self, vuln_id: str) -> Path:
         """Create evidence directory for a vulnerability."""
@@ -31,6 +34,9 @@ class EvidenceCapture:
         vuln_dir.mkdir(parents=True, exist_ok=True)
         (vuln_dir / "screenshots").mkdir(exist_ok=True)
         (vuln_dir / "requests").mkdir(exist_ok=True)
+        vuln_dir.chmod(0o700)
+        (vuln_dir / "screenshots").chmod(0o700)
+        (vuln_dir / "requests").chmod(0o700)
         return vuln_dir
     
     def save_screenshot(self, vuln_id: str, screenshot_data: bytes, 
@@ -62,9 +68,13 @@ class EvidenceCapture:
                            response: Dict[str, Any], description: str = "") -> str:
         """Save HTTP request/response evidence in professional format."""
         vuln_dir = self.create_vuln_evidence_dir(vuln_id)
+        request = redact_sensitive_data(request)
+        response = redact_sensitive_data(response)
+        description = redact_sensitive_text(description)
         
-        # Generate filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Microseconds prevent paired positive/control exchanges from
+        # overwriting each other when saved in the same second.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         filename = f"request_{timestamp}.txt"
         evidence_path = vuln_dir / "requests" / filename
         
@@ -125,6 +135,7 @@ class EvidenceCapture:
         
         with open(evidence_path, "w") as f:
             f.write(evidence)
+        evidence_path.chmod(0o600)
         
         # Save metadata
         metadata = {
@@ -144,12 +155,14 @@ class EvidenceCapture:
         meta_path = evidence_path.with_suffix(".json")
         with open(meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
+        meta_path.chmod(0o600)
         
         return str(evidence_path)
     
     def save_poc(self, vuln_id: str, poc_code: str, poc_type: str = "python") -> str:
         """Save proof of concept code."""
         vuln_dir = self.create_vuln_evidence_dir(vuln_id)
+        poc_code = redact_sensitive_text(poc_code)
         
         if poc_type == "python":
             poc_path = vuln_dir / "poc.py"
@@ -160,6 +173,7 @@ class EvidenceCapture:
         
         with open(poc_path, "w") as f:
             f.write(poc_code)
+        poc_path.chmod(0o600)
         
         # Save metadata
         metadata = {
@@ -171,6 +185,7 @@ class EvidenceCapture:
         meta_path = poc_path.with_suffix(".json")
         with open(meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
+        meta_path.chmod(0o600)
         
         return str(poc_path)
     
@@ -254,12 +269,13 @@ class EvidenceCapture:
         """Save findings summary."""
         vuln_dir = self.create_vuln_evidence_dir(vuln_id)
         summary_path = vuln_dir / "findings.json"
-        
+        findings = redact_sensitive_data(findings)
         findings["timestamp"] = datetime.now().isoformat()
         findings["evidence_dir"] = str(vuln_dir)
         
         with open(summary_path, "w") as f:
             json.dump(findings, f, indent=2)
+        summary_path.chmod(0o600)
         
         return str(summary_path)
     

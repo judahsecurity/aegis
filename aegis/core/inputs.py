@@ -127,10 +127,29 @@ def make_model_settings(
     *,
     model_name: str,
 ) -> ModelSettings:
+    normalized_model = model_name.strip().lower()
+    while normalized_model.startswith(("litellm/", "any-llm/")):
+        normalized_model = normalized_model.split("/", 1)[1]
+    extra_args: dict[str, Any] | None = None
+    if normalized_model.startswith("anthropic/"):
+        # LiteLLM translates this breakpoint to Anthropic cache_control.
+        # The system message follows tool definitions in Anthropic's cache
+        # prefix, so both the stable tool schema and system prompt are reused
+        # across the long autonomous loop.
+        extra_args = {
+            "cache_control_injection_points": [
+                {
+                    "location": "message",
+                    "role": "system",
+                    "control": {"type": "ephemeral"},
+                }
+            ]
+        }
     model_settings = ModelSettings(
         parallel_tool_calls=False,
         retry=DEFAULT_MODEL_RETRY,
         include_usage=True,
+        extra_args=extra_args,
     )
     if (
         reasoning_effort is not None

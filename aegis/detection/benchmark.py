@@ -38,8 +38,9 @@ class BenchmarkRunRecorder:
     ) -> None:
         self._path = storage_path
         self._lock = threading.RLock()
+        now = time.time()
         self.record: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "scan_id": scan_id,
             "model": model,
             "scan_mode": scan_mode,
@@ -47,7 +48,7 @@ class BenchmarkRunRecorder:
             "max_turns": max_turns,
             "max_budget_usd": max_budget_usd,
             "python_version": platform.python_version(),
-            "started_at": time.time(),
+            "started_at": now,
             "finished_at": None,
             "elapsed_seconds": None,
             "solved": False,
@@ -61,18 +62,92 @@ class BenchmarkRunRecorder:
             ],
             "events": [],
             "metrics": {},
+            "attempts": [],
         }
-        self._hydrate_or_persist()
+        self._hydrate_or_persist(
+            model=model,
+            scan_mode=scan_mode,
+            target_count=target_count,
+            max_turns=max_turns,
+            max_budget_usd=max_budget_usd,
+            attempt_started_at=now,
+        )
 
-    def _hydrate_or_persist(self) -> None:
+    def _hydrate_or_persist(
+        self,
+        *,
+        model: str,
+        scan_mode: str,
+        target_count: int,
+        max_turns: int,
+        max_budget_usd: float | None,
+        attempt_started_at: float,
+    ) -> None:
+        resumed = False
         if self._path.exists():
             try:
                 raw = json.loads(self._path.read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
+                    resumed = True
                     self.record.update(raw)
-                    return
             except (OSError, TypeError, ValueError):
                 pass
+
+        attempts = self.record.get("attempts")
+        if not isinstance(attempts, list):
+            attempts = []
+        # Migrate a pre-v2 terminal record into attempt history before opening
+        # the new attempt. This preserves the first run instead of leaving the
+        # benchmark file permanently frozen after a resume.
+        if resumed and not attempts and self.record.get("finished_at") is not None:
+            attempts.append(
+                {
+                    "attempt": 1,
+                    "resumed": False,
+                    "model": self.record.get("model"),
+                    "max_turns": self.record.get("max_turns"),
+                    "max_budget_usd": self.record.get("max_budget_usd"),
+                    "started_at": self.record.get("started_at"),
+                    "finished_at": self.record.get("finished_at"),
+                    "elapsed_seconds": self.record.get("elapsed_seconds"),
+                    "failure_stage": self.record.get("failure_stage"),
+                    "solved": bool(self.record.get("solved")),
+                }
+            )
+        prior_grade = self.record.pop("grade", None)
+        if isinstance(prior_grade, dict):
+            grades = self.record.setdefault("grades", [])
+            if isinstance(grades, list):
+                grades.append(prior_grade)
+        attempts.append(
+            {
+                "attempt": len(attempts) + 1,
+                "resumed": resumed,
+                "model": model,
+                "max_turns": max_turns,
+                "max_budget_usd": max_budget_usd,
+                "started_at": attempt_started_at,
+                "finished_at": None,
+                "elapsed_seconds": None,
+                "failure_stage": str(self.record.get("failure_stage") or "discovery"),
+                "solved": False,
+            }
+        )
+        self.record.update(
+            {
+                "schema_version": 2,
+                "model": model,
+                "scan_mode": scan_mode,
+                "target_count": target_count,
+                "max_turns": max_turns,
+                "max_budget_usd": max_budget_usd,
+                "finished_at": None,
+                "elapsed_seconds": None,
+                "solved": False,
+                "expected_value_present": None,
+                "attempts": attempts,
+            }
+        )
         self._persist()
 
     def _persist(self) -> None:
@@ -135,6 +210,23 @@ class BenchmarkRunRecorder:
             )
             if metrics:
                 self.record["metrics"].update(metrics)
+            attempts = self.record.get("attempts")
+            if isinstance(attempts, list) and attempts:
+                current = attempts[-1]
+                if isinstance(current, dict):
+                    attempt_started = current.get("started_at")
+                    current.update(
+                        {
+                            "finished_at": finished_at,
+                            "elapsed_seconds": (
+                                round(finished_at - float(attempt_started), 3)
+                                if isinstance(attempt_started, int | float)
+                                else None
+                            ),
+                            "failure_stage": "completed" if solved else failure_stage,
+                            "solved": bool(solved),
+                        }
+                    )
             self._persist()
 
 

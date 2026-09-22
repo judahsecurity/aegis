@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import time
 from collections import Counter
-from typing import TYPE_CHECKING, Any
-
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path
+from typing import Any
 
 
 def grade_run(
@@ -60,6 +58,40 @@ def grade_run(
     return grade
 
 
+def collect_run_output(run_dir: Path) -> str:
+    """Collect only agent-produced result artifacts for harness-side grading."""
+    parts: list[str] = []
+    for name in ("vulnerabilities.json", "penetration_test_report.md"):
+        path = run_dir / name
+        if path.is_file():
+            parts.append(path.read_text(encoding="utf-8"))
+    vulnerabilities_dir = run_dir / "vulnerabilities"
+    if vulnerabilities_dir.is_dir():
+        parts.extend(
+            path.read_text(encoding="utf-8")
+            for path in sorted(vulnerabilities_dir.glob("*.md"))
+        )
+    return "\n".join(parts)
+
+
+def grade_run_directory(
+    run_dir: Path,
+    *,
+    expected_value: str,
+    secure_control: bool = False,
+) -> dict[str, Any]:
+    """Grade a run directory while keeping expected proof outside agent state."""
+    record_path = run_dir / ".state" / "benchmark_run.json"
+    if not record_path.is_file():
+        raise FileNotFoundError(f"benchmark record not found: {record_path}")
+    return grade_run(
+        record_path,
+        expected_value=expected_value,
+        collected_output=collect_run_output(run_dir),
+        secure_control=secure_control,
+    )
+
+
 def aggregate_cohort(record_paths: list[Path]) -> dict[str, Any]:
     """Aggregate solve rate, controls, failure stages, and resource metrics."""
     records = [json.loads(path.read_text(encoding="utf-8")) for path in record_paths]
@@ -93,3 +125,36 @@ def aggregate_cohort(record_paths: list[Path]) -> dict[str, Any]:
         "failure_stages": dict(sorted(stages.items())),
         "average_elapsed_seconds": round(sum(elapsed) / len(elapsed), 3) if elapsed else None,
     }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point for blind harness grading and cohort summaries."""
+    parser = argparse.ArgumentParser(prog="aegis-benchmark")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    grade_parser = subparsers.add_parser("grade", help="grade one completed run")
+    grade_parser.add_argument("--run-dir", type=Path, required=True)
+    grade_parser.add_argument("--expected-file", type=Path, required=True)
+    grade_parser.add_argument("--secure-control", action="store_true")
+
+    cohort_parser = subparsers.add_parser("cohort", help="aggregate benchmark records")
+    cohort_parser.add_argument("records", type=Path, nargs="+")
+
+    args = parser.parse_args(argv)
+    if args.command == "grade":
+        expected_value = args.expected_file.read_text(encoding="utf-8").strip()
+        if not expected_value:
+            parser.error("--expected-file is empty")
+        result = grade_run_directory(
+            args.run_dir,
+            expected_value=expected_value,
+            secure_control=bool(args.secure_control),
+        )
+    else:
+        result = aggregate_cohort(args.records)
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))  # noqa: T201
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

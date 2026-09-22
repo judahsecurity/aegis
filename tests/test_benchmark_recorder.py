@@ -37,3 +37,50 @@ def test_benchmark_recorder_persists_stage_and_metrics(tmp_path: Path) -> None:
     assert payload["metrics"]["identity_count"] == 2
     assert payload["elapsed_seconds"] is not None
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_benchmark_recorder_opens_fresh_attempt_on_resume(tmp_path: Path) -> None:
+    path = tmp_path / "benchmark_run.json"
+    first = BenchmarkRunRecorder(
+        path,
+        scan_id="scan-test",
+        model="model-one",
+        scan_mode="deep",
+        target_count=1,
+        max_turns=100,
+        max_budget_usd=5.0,
+    )
+    first.finish(
+        solved=False,
+        expected_value_present=None,
+        failure_stage="hypothesis_generation",
+        metrics={"old": True},
+    )
+
+    resumed = BenchmarkRunRecorder(
+        path,
+        scan_id="scan-test",
+        model="model-two",
+        scan_mode="deep",
+        target_count=1,
+        max_turns=200,
+        max_budget_usd=10.0,
+    )
+    active = json.loads(path.read_text(encoding="utf-8"))
+
+    assert active["finished_at"] is None
+    assert active["model"] == "model-two"
+    assert active["max_budget_usd"] == 10.0
+    assert len(active["attempts"]) == 2
+    assert active["attempts"][0]["finished_at"] is not None
+    assert active["attempts"][1]["resumed"] is True
+
+    resumed.finish(
+        solved=False,
+        expected_value_present=None,
+        failure_stage="validation",
+    )
+    final = json.loads(path.read_text(encoding="utf-8"))
+    assert final["failure_stage"] == "validation"
+    assert final["attempts"][1]["failure_stage"] == "validation"
+    assert final["attempts"][1]["finished_at"] is not None

@@ -6,7 +6,8 @@ import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+
+from aegis.redaction import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ def _detect_tool_name(command: str) -> str:
     if "|" in cleaned:
         parts = cleaned.split("|")
         cleaned = parts[-1].strip()
-    
+
     cleaned_lower = cleaned.lower()
 
     for pattern, tool_name in _TOOL_PATTERNS:
@@ -138,8 +139,12 @@ def save_tool_output(
         run_path = Path(run_dir)
         tool_logs_dir = run_path / "tool_logs"
         tool_logs_dir.mkdir(parents=True, exist_ok=True)
+        tool_logs_dir.chmod(0o700)
 
-        tool_name = _detect_tool_name(command)
+        safe_command = redact_sensitive_text(command)
+        safe_output = redact_sensitive_text(output)
+
+        tool_name = _detect_tool_name(safe_command)
         filename = _get_next_filename(tool_logs_dir, tool_name)
         filepath = tool_logs_dir / filename
 
@@ -147,20 +152,22 @@ def save_tool_output(
 
         content = f"""{'=' * 70}
 Tool: {tool_name}
-Command: {command}
+Command: {safe_command}
 Timestamp: {timestamp}
 Agent: {agent_id or 'root'}
 {'=' * 70}
 
-{output}
+{safe_output}
 """
 
         filepath.write_text(content, encoding="utf-8")
+        filepath.chmod(0o600)
 
         # Also save a combined log of all commands
         combined_log = tool_logs_dir / "all_commands.log"
         with combined_log.open("a", encoding="utf-8") as f:
-            f.write(f"[{timestamp}] [{tool_name}] {command[:200]}\n")
+            f.write(f"[{timestamp}] [{tool_name}] {safe_command[:200]}\n")
+        combined_log.chmod(0o600)
 
         logger.debug("Saved tool output: %s", filepath)
         return str(filepath)

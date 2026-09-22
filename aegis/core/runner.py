@@ -28,7 +28,11 @@ from aegis.core.execution import (
 from aegis.core.execution import (
     spawn_child_agent as start_child_agent,
 )
-from aegis.core.hooks import BudgetExceededError, ReportUsageHooks
+from aegis.core.hooks import (
+    BudgetExceededError,
+    BudgetFinalizationRequiredError,
+    ReportUsageHooks,
+)
 from aegis.core.inputs import (
     DEFAULT_MAX_TURNS,
     build_root_task,
@@ -38,6 +42,7 @@ from aegis.core.inputs import (
 from aegis.core.paths import run_dir_for, runtime_state_dir
 from aegis.core.sessions import open_agent_session
 from aegis.detection.benchmark import BenchmarkRunRecorder
+from aegis.detection.evidence import assess_http_evidence
 from aegis.detection.store import DetectionStore
 from aegis.runtime import session_manager
 from aegis.telemetry.logging import set_scan_id, setup_scan_logging
@@ -229,6 +234,35 @@ async def run_aegis_scan(
             max_turns=max_turns,
             max_budget_usd=max_budget_usd,
         )
+        # A vulnerability may have been filed just before a previous budget
+        # stop. Reconcile persisted evidence on every resume so campaign state
+        # cannot remain stale merely because the reporting tool was the last
+        # successful action of that attempt.
+        with contextlib.suppress(Exception):
+            from aegis.report.state import get_global_report_state
+
+            report_state = get_global_report_state()
+            if report_state is not None:
+                for report in report_state.vulnerability_reports:
+                    evidence = report.get("http_requests")
+                    assessment = assess_http_evidence(
+                        evidence if isinstance(evidence, list) else None
+                    )
+                    detection_store.reconcile_report(
+                        report_id=str(report.get("id") or ""),
+                        endpoint=str(report.get("endpoint") or report.get("target") or ""),
+                        method=str(report.get("method") or "GET"),
+                        assessment=assessment,
+                    )
+                if report_state.vulnerability_reports:
+                    benchmark_recorder.mark_stage(
+                        "validation",
+                        detail=(
+                            f"Reconciled {len(report_state.vulnerability_reports)} "
+                            "persisted finding(s)"
+                        ),
+                        evidence_ref="vulnerabilities.json",
+                    )
         context: dict[str, Any] = {
             "coordinator": coordinator,
             "sandbox_session": bundle["session"],
@@ -331,6 +365,23 @@ async def run_aegis_scan(
                     str(final)[:300],
                 )
         return result  # noqa: TRY300
+    except BudgetFinalizationRequiredError as exc:
+        logger.info("Scan %s finalizing from persisted findings: %s", scan_id, exc)
+        if root_id is not None:
+            await coordinator.cancel_descendants(root_id)
+            with contextlib.suppress(Exception):
+                await coordinator.set_status(root_id, "completed")
+        with contextlib.suppress(Exception):
+            from aegis.report.state import get_global_report_state
+
+            report_state = get_global_report_state()
+            if report_state is not None:
+                report_state.finalize_from_persisted_findings(
+                    completed_categories=(
+                        sorted(test_tracker.completed_categories) if test_tracker else []
+                    )
+                )
+        return None
     except BudgetExceededError as exc:
         logger.info("Scan %s stopped: %s", scan_id, exc)
         if root_id is not None:
@@ -364,7 +415,10 @@ async def run_aegis_scan(
             if detection_store is not None:
                 health = detection_store.campaign_health()
                 metrics.update(health)
-                metrics["detection_confirmed_total"] = health["hypothesis_counts"]["confirmed"]
+                metrics["detection_confirmed_total"] = max(
+                    health["hypothesis_counts"]["confirmed"],
+                    health.get("verified_findings", 0),
+                )
             if test_tracker is not None:
                 metrics.update(
                     {

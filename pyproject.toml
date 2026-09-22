@@ -49,6 +49,7 @@ dependencies = [
 [project.scripts]
 aegis = "aegis.interface.main:main"
 aegis-web = "aegis.web.app:main"
+aegis-benchmark = "aegis.detection.scoring:main"
 
 [dependency-groups]
 dev = [

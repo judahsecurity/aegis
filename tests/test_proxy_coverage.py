@@ -13,7 +13,7 @@ from agents.tool_context import ToolContext
 from aegis.detection.store import DetectionStore
 from aegis.tools.enforcement.tracker import get_tracker
 from aegis.tools.proxy import caido_api
-from aegis.tools.proxy.tools import list_requests, repeat_request
+from aegis.tools.proxy.tools import _hydrate_detection_requests, list_requests, repeat_request
 
 
 def _request_result() -> SimpleNamespace:
@@ -195,3 +195,48 @@ async def test_listing_requests_hydrates_sessions_and_request_bodies(
     assert len(store.identities) == 1
     assert endpoint.parameters["body:role"].mutation_score >= 0.65
     assert "secret" not in json.dumps(store.snapshot())
+
+
+@pytest.mark.asyncio
+async def test_detection_hydration_reconnects_stale_client_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = object()
+    fresh = object()
+    captured = SimpleNamespace(
+        request=SimpleNamespace(
+            raw=b"GET /orders/7 HTTP/1.1\r\nHost: target.test\r\n\r\n",
+            host="target.test",
+            is_tls=True,
+        ),
+        response=SimpleNamespace(raw=b"HTTP/1.1 200 OK\r\n\r\norder"),
+    )
+    calls: list[object] = []
+    reconnects = 0
+
+    async def get_request(client: object, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        calls.append(client)
+        if client is stale:
+            raise RuntimeError("Connector is closed")
+        return captured
+
+    async def reconnect(_ctx: ToolContext) -> object:
+        nonlocal reconnects
+        reconnects += 1
+        return fresh
+
+    monkeypatch.setattr(caido_api, "get_request_with_client", get_request)
+    monkeypatch.setattr("aegis.tools.proxy.tools._reconnect_client", reconnect)
+    context = {"caido_client": stale, "_detection_store": DetectionStore()}
+    ctx = ToolContext(
+        context=context,
+        tool_name="list_requests",
+        tool_call_id="call-list",
+        tool_arguments="{}",
+    )
+
+    returned = await _hydrate_detection_requests(ctx, ["request-1", "request-2"], stale)
+
+    assert returned is fresh
+    assert reconnects == 1
+    assert fresh in calls

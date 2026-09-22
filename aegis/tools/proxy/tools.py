@@ -209,6 +209,52 @@ def _err(name: str, exc: Exception) -> str:
     )
 
 
+async def _hydrate_detection_requests(
+    ctx: RunContextWrapper,
+    request_ids: list[str],
+    client: Client,
+) -> Client:
+    """Hydrate listed requests, reconnecting a stale shared client once."""
+    hydration_limit = asyncio.Semaphore(8)
+    reconnect_lock = asyncio.Lock()
+    hydration_client = client
+
+    async def hydrate_request(request_id: str, active_client: Client) -> None:
+        nonlocal hydration_client
+        async with hydration_limit:
+            for hydration_attempt in range(2):
+                try:
+                    captured = await caido_api.get_request_with_client(
+                        active_client, request_id, part="request"
+                    )
+                    if captured is not None:
+                        _record_surface_from_result(
+                            ctx,
+                            request_id=request_id,
+                            result=captured,
+                            persist=False,
+                        )
+                    return
+                except Exception as exc:  # noqa: BLE001 - listing remains available.
+                    if hydration_attempt == 0 and _is_network_error(exc):
+                        async with reconnect_lock:
+                            if hydration_client is active_client:
+                                refreshed = await _reconnect_client(ctx)
+                                if refreshed is not None:
+                                    hydration_client = refreshed
+                            active_client = hydration_client
+                        continue
+                    logger.debug(
+                        "Could not hydrate request %s for detection: %s",
+                        request_id,
+                        exc,
+                    )
+                    return
+
+    await asyncio.gather(*(hydrate_request(request_id, client) for request_id in request_ids))
+    return hydration_client
+
+
 @function_tool(timeout=120)
 async def list_requests(
     ctx: RunContextWrapper,
@@ -331,31 +377,7 @@ async def list_requests(
                     persist=False,
                 )
 
-            hydration_limit = asyncio.Semaphore(8)
-
-            async def hydrate_request(request_id: str, active_client: Client) -> None:
-                async with hydration_limit:
-                    try:
-                        captured = await caido_api.get_request_with_client(
-                            active_client, request_id, part="request"
-                        )
-                        if captured is not None:
-                            _record_surface_from_result(
-                                ctx,
-                                request_id=request_id,
-                                result=captured,
-                                persist=False,
-                            )
-                    except Exception:  # noqa: BLE001 - listing must remain available.
-                        logger.debug(
-                            "Could not hydrate request %s for detection",
-                            request_id,
-                            exc_info=True,
-                        )
-
-            await asyncio.gather(
-                *(hydrate_request(request_id, client) for request_id in request_ids)
-            )
+            client = await _hydrate_detection_requests(ctx, request_ids, client)
             detection_store.flush()
 
             return json.dumps(
@@ -380,6 +402,7 @@ async def list_requests(
                     return _err("list_requests", exc)
                 continue
             return _err("list_requests", exc)
+    return _no_client()
 
 
 @function_tool(timeout=60)
